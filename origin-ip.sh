@@ -111,49 +111,50 @@ for ip in $direct_ips; do
 
   echo -e "\033[93mTesting IP: $ip\033[0m"
 
-  # Test HTTP Response
-  http_result=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: $domain" "http://$ip")
-  https_result=$(curl -k -s -o /dev/null -w "%{http_code}" -H "Host: $domain" "https://$ip")
-
-  # Content Analysis
-  ip_content=$(curl -s -H "Host: $domain" "http://$ip")
-  ip_hash=$(echo -n "$ip_content" | sha256sum | awk '{print $1}')
-  if [[ "$ip_hash" == "$target_hash" ]]; then
-    echo -e "\033[92mContent Matches Target Domain: $ip\033[0m"
-  else
-    echo -e "\033[91mContent Does Not Match: $ip\033[0m"
-  fi
-
-  # Test TLS Certificate with Curl
-  tls_cert=$(curl -k -v -H "Host: $domain" https://$ip 2>&1 | grep "subject:" | awk -F'subject: ' '{print $2}')
-  if [[ "$tls_cert" == *"$domain"* ]]; then
-    echo -e "\033[92mTLS Certificate Matches: $ip ($tls_cert)\033[0m"
-  else
-    echo -e "\033[91mTLS Certificate Mismatch: $ip ($tls_cert)\033[0m"
-  fi
-
   # Banner Grabbing
   banner=$(curl -s -I -H "Host: $domain" "http://$ip" | grep "Server:")
+
+  # Check for common CDN/Load Balancer banners
+  if [[ "$banner" =~ "awselb/2.0" || "$banner" =~ "cloudflare" || "$banner" =~ "AkamaiGHost" || "$banner" =~ "Fastly" || "$banner" =~ "GCLB" || "$banner" =~ "Microsoft-Azure-Application-Gateway" ]]; then
+    echo -e "\033[91mExcluded: Detected CDN/Load Balancer ($ip) - $banner\033[0m"
+    cdn_ips="$cdn_ips $ip"
+    continue
+  fi
+
   if [[ -n "$banner" ]]; then
     echo -e "\033[96mBanner Grabbing Result:\033[0m $banner"
   else
     echo -e "\033[91mNo Banner Retrieved: $ip\033[0m"
   fi
 
-  # Test Specific Endpoints
-  endpoint_hits=0
-  for endpoint in "/robots.txt" "/admin" "/api/status"; do
-    endpoint_result=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: $domain" "http://$ip$endpoint")
-    if [[ "$endpoint_result" == "200" || "$endpoint_result" == "301" ]]; then
-      echo -e "\033[92mEndpoint Accessible ($endpoint): $ip\033[0m"
-      endpoint_hits=$((endpoint_hits + 1))
-    fi
-  done
+  # Check for specific headers
+  headers=$(curl -s -I -H "Host: $domain" "http://$ip")
+  if echo "$headers" | grep -qi "CF-Ray"; then
+    echo -e "\033[91mExcluded: Cloudflare Detected ($ip) - CF-Ray Header Found\033[0m"
+    cdn_ips="$cdn_ips $ip"
+    continue
+  fi
 
-  # Evaluate if IP is a suspected true origin
-  if [[ ("$http_result" == "200" || "$http_result" == "301") || ("$https_result" == "200" || "$https_result" == "301") ]] && [[ "$ip_hash" == "$target_hash" ]] && [[ $endpoint_hits -gt 0 ]]; then
+  if echo "$headers" | grep -qi "X-Akamai-Staging"; then
+    echo -e "\033[91mExcluded: Akamai Detected ($ip) - X-Akamai-Staging Header Found\033[0m"
+    cdn_ips="$cdn_ips $ip"
+    continue
+  fi
+
+  if echo "$headers" | grep -qi "x-ms-routing-name"; then
+    echo -e "\033[91mExcluded: Azure Front Door Detected ($ip) - x-ms-routing-name Header Found\033[0m"
+    cdn_ips="$cdn_ips $ip"
+    continue
+  fi
+
+  # Content Analysis
+  ip_content=$(curl -s -H "Host: $domain" "http://$ip")
+  ip_hash=$(echo -n "$ip_content" | sha256sum | awk '{print $1}')
+  if [[ "$ip_hash" == "$target_hash" ]]; then
+    echo -e "\033[92mContent Matches Target Domain: $ip\033[0m"
     suspected_ips="$suspected_ips $ip"
-    echo -e "\033[92mSuspected True Origin IP: $ip\033[0m"
+  else
+    echo -e "\033[91mContent Does Not Match: $ip\033[0m"
   fi
 done
 

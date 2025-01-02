@@ -33,6 +33,11 @@ if [[ -z $domain ]]; then
   exit 1
 fi
 
+echo -e "\033[96mFetching Target Domain Content...\033[0m"
+curl -s "https://$domain" > target_content.html
+target_hash=$(sha256sum target_content.html | awk '{print $1}')
+echo -e "Target Content Hash: $target_hash"
+
 echo -e "\033[96mQuerying MX Records for $domain...\033[0m"
 mx_records=$(dig +short MX $domain)
 if [[ -z "$mx_records" ]]; then
@@ -67,13 +72,13 @@ else
 fi
 
 echo -e "\033[96mCollecting Potential IPs...\033[0m"
-all_ips=""
+all_ips="$mx_ips"
 
 # Collect A records
 dns_ips=$(echo "$subdomains" | xargs -I{} dig @1.1.1.1 {} A +short)
-all_ips="$all_ips $dns_ips $mx_ips"
+all_ips="$all_ips $dns_ips"
 
-# Fetch historical IPs
+# Fetch historical IPs using SecurityTrails API
 if [[ -n "$SECURITYTRAILS_API" ]]; then
   historical_ips=$(curl -s --request GET --url "https://api.securitytrails.com/v1/history/$domain/dns/a" --header "apikey: $SECURITYTRAILS_API" | jq -r '.records[].values[].ip' 2>/dev/null)
   all_ips="$all_ips $historical_ips"
@@ -84,7 +89,6 @@ all_ips=$(echo "$all_ips" | tr ' ' '\n' | sort -u)
 cdn_asns=("AS13335" "AS16509" "AS20940") # Cloudflare, AWS, Akamai
 direct_ips=""
 cdn_ips=""
-suspected_ips=""
 
 for ip in $all_ips; do
   asn=$(whois $ip | grep "OriginAS" | awk '{print $2}')
@@ -95,81 +99,76 @@ for ip in $all_ips; do
   fi
 done
 
-# Fetch target domain content hash
-echo -e "\033[96mFetching Target Domain Content Hash...\033[0m"
-target_content=$(curl -s "https://$domain")
-target_hash=$(echo -n "$target_content" | sha256sum | awk '{print $1}')
+# Prepare Python script for similarity analysis
+cat <<EOF > similarity_analysis.py
+import sys
+from difflib import SequenceMatcher
 
-echo -e "Target Content Hash: $target_hash"
+def compute_similarity(file1, file2):
+    with open(file1, 'r', encoding='utf-8') as f1, open(file2, 'r', encoding='utf-8') as f2:
+        content1 = f1.read()
+        content2 = f2.read()
+        similarity = SequenceMatcher(None, content1, content2).ratio()
+    return similarity
 
-# Backend Testing
+if __name__ == "__main__":
+    target_file = sys.argv[1]
+    ip_file = sys.argv[2]
+    similarity = compute_similarity(target_file, ip_file)
+    print(f"{similarity:.2f}")
+EOF
+
 echo -e "\033[96mTesting Backend IPs...\033[0m"
 for ip in $direct_ips; do
-  if [[ -z "$ip" ]]; then
-    continue
-  fi
-
   # Retrieve ASN for the IP
   asn=$(whois $ip | grep "OriginAS" | awk '{print $2}')
   echo -e "\033[93mTesting IP: $ip (ASN: $asn)\033[0m"
 
-  # Banner Grabbing
-  banner=$(curl -s -I -H "Host: $domain" "http://$ip" | grep "Server:")
+  # Fetch content from IP
+  curl -s -H "Host: $domain" "http://$ip" > ip_content.html
+  ip_hash=$(sha256sum ip_content.html | awk '{print $1}')
 
-  # Check for common CDN/Load Balancer banners
-  if [[ "$banner" =~ "awselb/2.0" || "$banner" =~ "cloudflare" || "$banner" =~ "AkamaiGHost" || "$banner" =~ "Fastly" || "$banner" =~ "GCLB" || "$banner" =~ "Microsoft-Azure-Application-Gateway" ]]; then
-    echo -e "\033[91mExcluded: Detected CDN/Load Balancer ($ip) - $banner\033[0m"
-    cdn_ips="$cdn_ips $ip"
-    continue
+  # Hash-based match
+  if [[ "$ip_hash" == "$target_hash" ]]; then
+    echo -e "\033[92mContent Hash Matches Target Domain: $ip\033[0m"
+  else
+    echo -e "\033[91mContent Hash Does Not Match: $ip\033[0m"
   fi
 
+  # Banner Grabbing
+  banner=$(curl -s -I -H "Host: $domain" "http://$ip" | grep "Server:")
   if [[ -n "$banner" ]]; then
     echo -e "\033[96mBanner Grabbing Result:\033[0m $banner"
   else
     echo -e "\033[91mNo Banner Retrieved: $ip\033[0m"
   fi
 
-  # Check for specific headers
+  # Check for specific headers (CDN Detection)
   headers=$(curl -s -I -H "Host: $domain" "http://$ip")
   if echo "$headers" | grep -qi "CF-Ray"; then
     echo -e "\033[91mExcluded: Cloudflare Detected ($ip) - CF-Ray Header Found\033[0m"
-    cdn_ips="$cdn_ips $ip"
     continue
   fi
-
   if echo "$headers" | grep -qi "X-Akamai-Staging"; then
     echo -e "\033[91mExcluded: Akamai Detected ($ip) - X-Akamai-Staging Header Found\033[0m"
-    cdn_ips="$cdn_ips $ip"
     continue
   fi
-
   if echo "$headers" | grep -qi "x-ms-routing-name"; then
     echo -e "\033[91mExcluded: Azure Front Door Detected ($ip) - x-ms-routing-name Header Found\033[0m"
-    cdn_ips="$cdn_ips $ip"
     continue
   fi
 
-  # Content Analysis
-  ip_content=$(curl -s -H "Host: $domain" "http://$ip")
-  ip_hash=$(echo -n "$ip_content" | sha256sum | awk '{print $1}')
-  if [[ "$ip_hash" == "$target_hash" ]]; then
-    echo -e "\033[92mContent Matches Target Domain: $ip\033[0m"
-    suspected_ips="$suspected_ips $ip"
+  # Perform similarity analysis using Python
+  similarity=$(python3 similarity_analysis.py target_content.html ip_content.html)
+  echo -e "Similarity Score: $similarity"
+
+  # Threshold for similarity (avoiding bc)
+  if (( $(python3 -c "print(1 if $similarity > 0.8 else 0)") )); then
+    echo -e "\033[92mSuspected True Origin IP: $ip (Similarity: $similarity)\033[0m"
   else
-    echo -e "\033[91mContent Does Not Match: $ip\033[0m"
+    echo -e "\033[91mNot a Match: $ip (Similarity: $similarity)\033[0m"
   fi
 done
 
-echo -e "\033[91mCDN and Load Balancer IPs:\033[0m"
-if [[ -z "$cdn_ips" ]]; then
-  echo "No CDN or Load Balancer IPs detected."
-else
-  echo "$cdn_ips" | tr ' ' '\n'
-fi
-
-echo -e "\033[96mSuspected True Origin IPs:\033[0m"
-if [[ -z "$suspected_ips" ]]; then
-  echo "No suspected true origin IPs identified."
-else
-  echo "$suspected_ips" | tr ' ' '\n'
-fi
+# Cleanup
+rm -f target_content.html ip_content.html similarity_analysis.py

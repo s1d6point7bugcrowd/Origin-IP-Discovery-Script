@@ -109,7 +109,9 @@ for ip in $direct_ips; do
     continue
   fi
 
-  echo -e "\033[93mTesting IP: $ip\033[0m"
+  # Retrieve ASN for the IP
+  asn=$(whois $ip | grep "OriginAS" | awk '{print $2}')
+  echo -e "\033[93mTesting IP: $ip (ASN: $asn)\033[0m"
 
   # Banner Grabbing
   banner=$(curl -s -I -H "Host: $domain" "http://$ip" | grep "Server:")

@@ -136,6 +136,8 @@ Limitations
     MX Record Filtering: Email server IPs often do not relate to web server infrastructure.
 
 
+***TLS certificates on origin servers might not always match the domain name.***
+
 ## Disclaimer
 
 This script is intended for ethical and authorized use only. By using this script, you agree to the following:
